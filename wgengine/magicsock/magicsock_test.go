@@ -2982,6 +2982,48 @@ func newPingResponder(t *testing.T) *pingResponder {
 	return pr
 }
 
+func TestExcludedEndpointFallsBackToDERP(t *testing.T) {
+	now := mono.Now()
+	derp := netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 1)
+	lan := netip.MustParseAddrPort("192.168.20.4:41641")
+	e := endpoint{
+		c: &Conn{excludedEndpointPrefixes: []netip.Prefix{
+			netip.MustParsePrefix("10.244.250.0/24"),
+		}},
+		derpAddr:           derp,
+		trustBestAddrUntil: now.Add(time.Minute),
+	}
+	for _, bad := range []string{"10.244.250.4:41641", "[::ffff:10.244.250.4]:41641"} {
+		t.Run(bad, func(t *testing.T) {
+			blocked := netip.MustParseAddrPort(bad)
+			e.bestAddr = addrQuality{epAddr: epAddr{ap: blocked}}
+			udp, relay, _ := e.addrForSendLocked(now)
+			if udp.ap.IsValid() || relay != derp {
+				t.Fatalf("send to excluded %v selected UDP %v and DERP %v, want DERP %v only", blocked, udp.ap, relay, derp)
+			}
+			e.bestAddr.wireMTU = 1500
+			pingUDP, pingRelay := e.addrForPingSizeLocked(now, 100)
+			if pingUDP.ap.IsValid() || pingRelay != derp {
+				t.Fatalf("ping to excluded %v selected UDP %v and DERP %v, want DERP %v only", blocked, pingUDP.ap, pingRelay, derp)
+			}
+			e.endpointState = make(map[netip.AddrPort]*endpointState)
+			e.addCandidateEndpoint(blocked, stun.TxID{})
+			if _, ok := e.endpointState[blocked]; ok {
+				t.Fatalf("learned excluded endpoint %v", blocked)
+			}
+			e.addCandidateEndpoint(lan, stun.TxID{})
+			if _, ok := e.endpointState[lan]; !ok {
+				t.Fatalf("did not learn LAN endpoint %v", lan)
+			}
+		})
+	}
+	e.bestAddr = addrQuality{epAddr: epAddr{ap: lan}}
+	udp, relay, _ := e.addrForSendLocked(now)
+	if udp.ap != lan || relay.IsValid() {
+		t.Fatalf("send to LAN selected UDP %v and DERP %v, want direct UDP %v", udp.ap, relay, lan)
+	}
+}
+
 func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 	testTime := mono.Now()
 	secondPingTime := testTime.Add(10 * time.Second)
@@ -3237,6 +3279,7 @@ func TestAddrForPingSizeLocked(t *testing.T) {
 				bestAddr.epAddr.ap = validUdpAddr
 			}
 			ep := &endpoint{
+				c:        &Conn{},
 				derpAddr: validDerpAddr,
 				bestAddr: bestAddr,
 			}

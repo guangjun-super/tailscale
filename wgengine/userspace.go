@@ -261,6 +261,10 @@ type Config struct {
 	// Tailscale start and kept only in memory.
 	ForceDiscoKey key.DiscoPrivate
 
+	// ExcludedEndpointPrefixes are IP networks that the engine must avoid
+	// when advertising, discovering, or sending to UDP transport endpoints.
+	ExcludedEndpointPrefixes []netip.Prefix
+
 	// OnDERPRecv, if non-nil, is called for every non-disco packet
 	// received from DERP before the peer map lookup. If it returns
 	// true, the packet is considered handled and is not passed to
@@ -442,6 +446,8 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		PeerByKeyFunc:  e.PeerByKey,
 		ForceDiscoKey:  conf.ForceDiscoKey,
 		OnDERPRecv:     conf.OnDERPRecv,
+
+		ExcludedEndpointPrefixes: conf.ExcludedEndpointPrefixes,
 	}
 	var err error
 	e.magicConn, err = magicsock.NewConn(magicsockOpts)
