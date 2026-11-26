@@ -634,6 +634,9 @@ func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
 // TODO(val): Rewrite the addrFor*Locked() variations to share code.
 func (de *endpoint) addrForSendLocked(now mono.Time, forceMirror bool) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
 	udpAddr = de.bestAddr.epAddr
+	if udpAddr.ap.IsValid() && de.c.excludesEndpoint(udpAddr.ap.Addr()) {
+		udpAddr = epAddr{}
+	}
 
 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) && !forceMirror {
 		return udpAddr, netip.AddrPort{}, false
@@ -670,7 +673,12 @@ func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, s
 	// for the first latency retrieved.
 	lowestLatency := time.Hour
 	var oldestPing mono.Time
+	numCandidates := 0
 	for ipp, state := range de.endpointState {
+		if de.c.excludesEndpoint(ipp.Addr()) {
+			continue
+		}
+		numCandidates++
 		if oldestPing.IsZero() {
 			oldestPing = state.lastPing
 		} else if state.lastPing.Before(oldestPing) {
@@ -687,10 +695,15 @@ func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, s
 			}
 		}
 	}
-	needPing := len(de.endpointState) > 1 && now.Sub(oldestPing) > wireguardPingInterval
+	if numCandidates == 0 {
+		return epAddr{}, false
+	}
+	needPing := numCandidates > 1 && now.Sub(oldestPing) > wireguardPingInterval
 
 	if !udpAddr.ap.IsValid() {
-		candidates := slicesx.MapKeys(de.endpointState)
+		candidates := slices.DeleteFunc(slicesx.MapKeys(de.endpointState), func(addr netip.AddrPort) bool {
+			return de.c.excludesEndpoint(addr.Addr())
+		})
 
 		// Randomly select an address to use until we retrieve latency information
 		// and give it a short trustBestAddrUntil time so we avoid flapping between
@@ -727,7 +740,7 @@ func (de *endpoint) addrForPingSizeLocked(now mono.Time, size int) (udpAddr epAd
 	requestedMTU := pingSizeToPktLen(size, udpAddr)
 	mtuOk := requestedMTU <= pathMTU
 
-	if udpAddr.ap.IsValid() && mtuOk {
+	if udpAddr.ap.IsValid() && mtuOk && !de.c.excludesEndpoint(udpAddr.ap.Addr()) {
 		if !now.After(de.trustBestAddrUntil) {
 			return udpAddr, netip.AddrPort{}
 		}
@@ -1803,6 +1816,9 @@ func (de *endpoint) setEndpointsLocked(eps interface {
 			de.c.logf("magicsock: bogus netmap endpoint from %v", eps)
 			continue
 		}
+		if de.c.excludesEndpoint(ipp.Addr()) {
+			continue
+		}
 		if st, ok := de.endpointState[ipp]; ok {
 			st.index = int16(i)
 		} else {
@@ -1835,6 +1851,9 @@ func (de *endpoint) setEndpointsLocked(eps interface {
 // This is called once we've already verified that we got a valid
 // discovery message from de via ep.
 func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.TxID) (duplicatePing bool) {
+	if de.c.excludesEndpoint(ep.Addr()) {
+		return false
+	}
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
@@ -2189,6 +2208,9 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 	}
 	var newEPs []netip.AddrPort
 	for _, ep := range m.MyNumber {
+		if de.c.excludesEndpoint(ep.Addr()) {
+			continue
+		}
 		if ep.Addr().Is6() && ep.Addr().IsLinkLocalUnicast() {
 			// We send these out, but ignore them for now.
 			// TODO: teach the ping code to ping on all interfaces

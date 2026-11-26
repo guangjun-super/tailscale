@@ -173,6 +173,8 @@ type Conn struct {
 	controlKnobs           *controlknobs.Knobs                                     // or nil
 	derpAppName            string                                                  // or empty, see Options.DERPAppName
 
+	excludedEndpointPrefixes []netip.Prefix
+
 	// ================================================================
 	// No locking required to access these fields, either because
 	// they're static after construction, or are wholly owned by a
@@ -457,6 +459,10 @@ func (c *Conn) dlogf(format string, a ...any) {
 
 // Options contains options for Listen.
 type Options struct {
+	// ExcludedEndpointPrefixes are IP networks to exclude from UDP transport.
+	// NewConn copies the slice.
+	ExcludedEndpointPrefixes []netip.Prefix
+
 	// EventBus, if non-nil, is used for event publication and subscription by
 	// each Conn created from these Options. It must not be nil outside of
 	// tests.
@@ -679,6 +685,12 @@ func NewConn(opts Options) (*Conn, error) {
 	c.idleFunc = opts.IdleFunc
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.onDERPRecv = opts.OnDERPRecv
+	c.excludedEndpointPrefixes = slices.Clone(opts.ExcludedEndpointPrefixes)
+	for i, prefix := range c.excludedEndpointPrefixes {
+		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+			c.excludedEndpointPrefixes[i] = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+	}
 
 	// Set up publishers and subscribers. Subscribe calls must return before
 	// NewConn otherwise published events can be missed.
@@ -1334,7 +1346,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		return
 	}
 	addAddr := func(ipp netip.AddrPort, et tailcfg.EndpointType) {
-		if !ipp.IsValid() || (debugOmitLocalAddresses() && et == tailcfg.EndpointLocal) {
+		if !ipp.IsValid() || c.excludesEndpoint(ipp.Addr()) || (debugOmitLocalAddresses() && et == tailcfg.EndpointLocal) {
 			return
 		}
 		if _, ok := already[ipp]; !ok {
@@ -1565,6 +1577,9 @@ func (c *Conn) SendTo(flow int, buffs [][]byte, ep conn.Endpoint, offset int) (e
 		if !hasUDPTransport {
 			return errNoUDP
 		}
+		if c.excludesEndpoint(ep.src.ap.Addr()) {
+			return errExcludedEndpoint
+		}
 		if ep.src.ap.Addr().Is6() {
 			return c.pconn6.WriteWireGuardBatchTo(flow, buffs, ep.src, offset)
 		}
@@ -1596,9 +1611,24 @@ var errNoUDP = errors.New("no UDP available on platform")
 // peer traffic is relayed over DERP.
 const hasUDPTransport = buildfeatures.HasUDPTransport && runtime.GOOS != "js"
 
+var errExcludedEndpoint = errors.New("UDP endpoint address is excluded")
+
+func (c *Conn) excludesEndpoint(addr netip.Addr) bool {
+	addr = addr.WithZone("").Unmap()
+	for _, prefix := range c.excludedEndpointPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Conn) sendUDPBatch(flow int, addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
 	if !hasUDPTransport {
 		return false, errNoUDP
+	}
+	if c.excludesEndpoint(addr.ap.Addr()) {
+		return false, errExcludedEndpoint
 	}
 	isIPv6 := false
 	switch {
@@ -1707,6 +1737,9 @@ func (c *Conn) sendUDPNetcheck(b []byte, addr netip.AddrPort) (int, error) {
 	if !hasUDPTransport || c.onlyTCP443.Load() {
 		return 0, errors.ErrUnsupported
 	}
+	if c.excludesEndpoint(addr.Addr()) {
+		return 0, errExcludedEndpoint
+	}
 	switch {
 	case addr.Addr().Is4():
 		return c.pconn4.WriteToUDPAddrPort(b, addr)
@@ -1722,6 +1755,9 @@ func (c *Conn) sendUDPNetcheck(b []byte, addr netip.AddrPort) (int, error) {
 func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) {
 	if c.onlyTCP443.Load() {
 		return false, nil
+	}
+	if c.excludesEndpoint(addr.Addr()) {
+		return false, errExcludedEndpoint
 	}
 	switch {
 	case addr.Addr().Is4():
@@ -2297,6 +2333,9 @@ func packetLooksLike(msg []byte) (t packetLooksLikeType, isGeneveEncap bool) {
 // 'shouldBeRelayHandshakeMsg' will be true if 'msg' was encapsulated
 // by a Geneve header with the control bit set.
 func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshakeMsg bool, derpNodeSrc key.NodePublic, via discoRXPath) {
+	if derpNodeSrc.IsZero() && c.excludesEndpoint(src.ap.Addr()) {
+		return
+	}
 	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):discoHeaderLen]))
 
 	c.mu.Lock()
